@@ -73,7 +73,7 @@ export function encodeIosAppStoreVersion(
   return `${parsed.year}.${parsed.month}.${encodedPatch}`;
 }
 
-export function resolveGatewayVersionForIosRelease(rootDir = path.resolve(".")): {
+function resolveGatewayVersionForIosRelease(rootDir = path.resolve(".")): {
   gatewayVersion: string;
   pinnedIosVersion: string;
 } {
