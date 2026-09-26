@@ -190,7 +190,12 @@ describe("prepareCliBundleMcpConfig", () => {
     clearPluginMetadataLifecycleCaches();
   });
 
-  it("projects session MCP tool denials into Claude disallowed tools", async () => {
+  it.each([
+    ["--disallowedTools", "Bash(rm *)"],
+    ["--disallowed-tools", "Bash(rm *)"],
+    ["--disallowedTools=Bash(rm *)"],
+    ["--disallowed-tools=Bash(rm *)"],
+  ])("projects session MCP tool denials alongside %s", async (...args) => {
     const workspaceDir = await cliBundleMcpHarness.tempHarness.createTempDir(
       "openclaw-cli-bundle-mcp-deny-",
     );
@@ -199,7 +204,7 @@ describe("prepareCliBundleMcpConfig", () => {
       mode: "claude-config-file",
       backend: {
         command: "claude",
-        args: ["--disallowedTools", "Bash(rm *)"],
+        args,
       },
       workspaceDir,
       config: {
@@ -209,7 +214,14 @@ describe("prepareCliBundleMcpConfig", () => {
       toolOverrides: { mcpToolsDeny: { docs: ["delete_docs"] }, webSearch: false },
     });
 
-    expect(prepared.backend.args).toContain("Bash(rm *),WebSearch,mcp__docs__delete_docs");
+    expect(prepared.backend.args).toEqual([
+      "--strict-mcp-config",
+      "--mcp-config",
+      requireMcpConfigPath(prepared.backend.args),
+      "--disallowedTools",
+      "Bash(rm *),WebSearch,mcp__docs__delete_docs",
+    ]);
+    expect(prepared.backend.resumeArgs).toEqual(prepared.backend.args);
     await prepared.cleanup?.();
   });
 
