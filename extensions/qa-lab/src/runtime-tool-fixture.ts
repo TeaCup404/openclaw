@@ -1,4 +1,3 @@
-// Qa Lab plugin module implements runtime tool fixture behavior.
 import { realpathSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -20,6 +19,7 @@ import {
   type QaRuntimeToolCoverageMetadata,
   readRuntimeToolCoverageMetadata,
 } from "./runtime-tool-metadata.js";
+import { readQaMessageFunctionCalls, readQaTranscriptMessages } from "./runtime-transcript.js";
 import { readRawQaSessionStore } from "./suite-runtime-agent-session.js";
 import type { QaSuiteRuntimeEnv } from "./suite-runtime-types.js";
 
@@ -445,28 +445,10 @@ function extractTranscriptToolCalls(
     }
   }
 
-  const rawToolCalls =
-    message.tool_calls ?? message.toolCalls ?? message.function_call ?? message.functionCall;
-  const toolCalls = Array.isArray(rawToolCalls) ? rawToolCalls : rawToolCalls ? [rawToolCalls] : [];
-  for (const call of toolCalls) {
-    if (!isRecord(call)) {
-      continue;
+  for (const call of readQaMessageFunctionCalls(message)) {
+    if (call.tool) {
+      calls.push({ ...call, tool: call.tool });
     }
-    const functionRecord = isRecord(call.function) ? call.function : undefined;
-    const tool =
-      normalizeOptionalString(call.name) ?? normalizeOptionalString(functionRecord?.name);
-    if (!tool) {
-      continue;
-    }
-    calls.push({
-      id:
-        normalizeOptionalString(call.id) ??
-        normalizeOptionalString(call.toolCallId) ??
-        normalizeOptionalString(call.toolUseId),
-      tool,
-      args:
-        call.arguments ?? functionRecord?.arguments ?? call.input ?? functionRecord?.input ?? null,
-    });
   }
   return calls;
 }
@@ -582,22 +564,9 @@ function transcriptToolResultLinksCall(params: {
 function readTranscriptToolEvidence(transcriptBytes: string, toolName: string) {
   const calls: QaRuntimeToolFixtureTranscriptToolCall[] = [];
   const results: QaRuntimeToolFixtureTranscriptToolResult[] = [];
-  for (const line of transcriptBytes.split(/\r?\n/u)) {
-    const trimmed = line.trim();
-    if (!trimmed) {
-      continue;
-    }
-    try {
-      const parsed = JSON.parse(trimmed) as unknown;
-      const message = isRecord(parsed) && isRecord(parsed.message) ? parsed.message : undefined;
-      if (!message) {
-        continue;
-      }
-      calls.push(...extractTranscriptToolCalls(message).filter((call) => call.tool === toolName));
-      results.push(...extractTranscriptToolResults(message));
-    } catch {
-      // Ignore malformed transcript rows and keep live fixture evidence deterministic.
-    }
+  for (const message of readQaTranscriptMessages(transcriptBytes)) {
+    calls.push(...extractTranscriptToolCalls(message).filter((call) => call.tool === toolName));
+    results.push(...extractTranscriptToolResults(message));
   }
   const linkedEvidence = calls
     .map((call) => ({
