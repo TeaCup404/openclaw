@@ -528,7 +528,6 @@ async function generateOpenAICodexImage(params: {
   const [
     {
       assertOkOrThrowHttpError,
-      isModelNotFoundErrorMessage,
       postJsonRequest,
       resolveProviderHttpRequestConfig,
       sanitizeConfiguredModelProviderRequest,
@@ -649,7 +648,8 @@ async function generateOpenAICodexImage(params: {
         if (
           !nextResponsesModel ||
           !(error instanceof Error) ||
-          !isModelNotFoundErrorMessage(error.message)
+          error.message !==
+            `OpenAI Codex image generation failed (HTTP 400): The '${responsesModel}' model is not supported when using Codex with a ChatGPT account.`
         ) {
           throw error;
         }
