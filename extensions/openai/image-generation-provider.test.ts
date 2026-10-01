@@ -429,7 +429,7 @@ describe("openai image generation provider", () => {
 
     it("keeps the default Codex OAuth image model while the account accepts it", async () => {
       mockCodexAuthOnly();
-      mockCodexImageStream({ imageData: "codex-default-model-image" });
+      mockCodexImageStream();
 
       const result = await generateOpenAIImage("Draw with the default model", {
         authStore: { version: 1, profiles: {} },
@@ -438,12 +438,12 @@ describe("openai image generation provider", () => {
 
       expect(postJsonRequestMock).toHaveBeenCalledTimes(1);
       expect((jsonRequestCall().body as Record<string, unknown>).model).toBe("gpt-6-astra");
-      expect(result.images[0]?.buffer).toEqual(Buffer.from("codex-default-model-image"));
+      expect(result.images[0]?.buffer).toEqual(Buffer.from("codex-image"));
     });
 
     it("retries Codex OAuth image generation with a configured model the plan supports", async () => {
       mockCodexAuthOnly();
-      mockCodexImageStream({ imageData: "codex-configured-model-image" });
+      mockCodexImageStream();
       assertOkOrThrowHttpErrorMock.mockRejectedValueOnce(
         new Error(
           "OpenAI Codex image generation failed (HTTP 400): The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT account.",
@@ -465,9 +465,24 @@ describe("openai image generation provider", () => {
         "codex image responses model unavailable: responsesModel=gpt-6-astra retryResponsesModel=gpt-6-luna",
       );
       expect(result.images.map((image) => image.buffer)).toEqual([
-        Buffer.from("codex-configured-model-image"),
-        Buffer.from("codex-configured-model-image"),
+        Buffer.from("codex-image"),
+        Buffer.from("codex-image"),
       ]);
+    });
+
+    it.each([
+      "Invalid image size",
+      "Unknown model",
+      "The 'gpt-6-astra' model does not support image generation.",
+    ])("does not retry an unrelated HTTP 400: %s", async (detail) => {
+      mockCodexAuthOnly();
+      mockCodexImageStream();
+      const error = new Error(`OpenAI Codex image generation failed (HTTP 400): ${detail}`);
+      assertOkOrThrowHttpErrorMock.mockRejectedValueOnce(error);
+      await expect(
+        generateOpenAIImage("Draw an image", { cfg: configuredOpenAIFallback }),
+      ).rejects.toThrow(error);
+      expect(postJsonRequestMock).toHaveBeenCalledTimes(1);
     });
   });
 
