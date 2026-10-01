@@ -9,6 +9,7 @@ import { prepareInternalSessionEffectsSession } from "../../agents/internal-sess
 import { ensureSessionGroupCatalog } from "../../gateway/session-group-catalog.js";
 import { ensureSessionGroupRegistered, listSessionGroups } from "../../gateway/session-groups.js";
 import { prepareSessionMutationFacts } from "../../gateway/session-sharing-preparation.js";
+import { acquireStateDatabaseSchemaLease } from "../../infra/gateway-state-owner.js";
 import { createEmptyPluginRegistry } from "../../plugins/registry-empty.js";
 import {
   markPluginRegistryActive,
@@ -21,6 +22,7 @@ import { readOpenClawAgentDatabaseIdentity } from "../../state/openclaw-agent-db
 import {
   closeOpenClawAgentDatabaseByPathAsync,
   openOpenClawAgentDatabase,
+  runOpenClawAgentWriteTransaction,
 } from "../../state/openclaw-agent-db.js";
 import { createOpenClawDatabaseMaintenanceScope } from "../../state/openclaw-state-db-async-lifecycle.js";
 import { createSessionRepositoryWorkspaceStore } from "../../state/session-repository-workspaces.js";
@@ -71,12 +73,17 @@ it("creates with prepared label facts, header and atomic owner without host data
     let assertCreation: () => void = () => {
       throw new Error("Creation has not bound its owner");
     };
-    writeSessionEntry(database, "agent:main:sibling", {
-      sessionId: "sibling",
-      label: "taken",
-      updatedAt: 1,
-      skillsSnapshot: { prompt: "unrelated".repeat(1024), skills: [] },
-    });
+    runOpenClawAgentWriteTransaction(
+      (db) => {
+        writeSessionEntry(db, "agent:main:sibling", {
+          sessionId: "sibling",
+          label: "taken",
+          updatedAt: 1,
+          skillsSnapshot: { prompt: "unrelated".repeat(1024), skills: [] },
+        });
+      },
+      { agentId: database.agentId, path: database.path },
+    );
     const env = { ...process.env };
     const originalStateDir = env.OPENCLAW_STATE_DIR;
     const order: string[] = [];
@@ -96,16 +103,19 @@ it("creates with prepared label facts, header and atomic owner without host data
         { agentId: "main", storePath, sessionKey: key, env },
         async (snapshot) => {
           expect(snapshot.existingEntry).toBeUndefined();
-          expect(snapshot.labelInUse).toBe(true);
+          expect(snapshot.labelInUse).toBe(false);
           env.OPENCLAW_STATE_DIR = state.statePath("changed-during-preparation");
           assertCreation();
           await Promise.resolve();
           assertCreation();
-          expect(snapshot.labelInUse).toBe(true);
-          return { ok: true, entry: { sessionId: "created", updatedAt: 2, category: "Created" } };
+          expect(snapshot.labelInUse).toBe(false);
+          return {
+            ok: true,
+            entry: { sessionId: "created", updatedAt: 2, category: "Created", label: "available" },
+          };
         },
         {
-          label: "taken",
+          label: "available",
           bindCreation: (operation) => {
             prepared.bindCreation(operation);
             assertCreation = () =>
@@ -137,7 +147,10 @@ it("creates with prepared label facts, header and atomic owner without host data
           },
         },
       );
-      expect(result).toMatchObject({ ok: true, entry: { sessionId: "created" } });
+      expect(result).toMatchObject({
+        ok: true,
+        entry: { sessionId: "created", label: "available" },
+      });
       const writes = post.mock.calls.flatMap(([request]) => {
         if (
           !isRecord(request) ||
@@ -272,10 +285,15 @@ it.each(["incognito", "maintenance"] as const)(
             : "agent:main:native-maintenance",
       };
       const database = openOpenClawAgentDatabase(toDatabaseOptions(resolveSqliteScope(scope)));
-      const maintenance =
-        kind === "maintenance"
-          ? createOpenClawDatabaseMaintenanceScope(() => undefined)
-          : undefined;
+      const schemaLease =
+        kind === "maintenance" ? acquireStateDatabaseSchemaLease(database.path) : undefined;
+      const maintenance = schemaLease
+        ? createOpenClawDatabaseMaintenanceScope({
+            schemaMaintenance: true,
+            assertOwnerCurrent: () => schemaLease.assertCurrent(),
+            assertDatabaseAccess: schemaLease.assertDatabaseAccess,
+          })
+        : undefined;
       let followed = false;
       const create = () =>
         createSessionEntryWithTranscript(
@@ -297,7 +315,11 @@ it.each(["incognito", "maintenance"] as const)(
         expect((await (maintenance ? maintenance.run(create) : create())).ok).toBe(true);
         expect(followed).toBe(true);
       } finally {
-        await maintenance?.close();
+        try {
+          await maintenance?.close();
+        } finally {
+          schemaLease?.release();
+        }
       }
     });
   },
@@ -510,13 +532,13 @@ it("keeps native alias deletion rollback and creation notifications with the ori
     const alias = sessionKey.toLowerCase();
     const original = { sessionId: "native-alias", updatedAt: 1, agentHarnessId: "alias-owner" };
     const repositories = createSessionRepositoryWorkspaceStore();
-    const workspace = repositories.create({
+    const workspace = await repositories.create({
       agentId: "main",
       sessionKey: alias,
       url: "https://github.com/example/alias.git",
       assertCurrent: () => {},
     });
-    const siblingWorkspace = repositories.create({
+    const siblingWorkspace = await repositories.create({
       agentId: "other",
       sessionKey: alias,
       url: "https://github.com/example/sibling.git",
@@ -591,7 +613,7 @@ it("keeps native alias deletion rollback and creation notifications with the ori
     try {
       await expect(create()).rejects.toThrow("native alias failure");
       expect(order).toEqual(["prepare", "native", "rollback"]);
-      expect(repositories.get(workspace.workspaceId)).toEqual(workspace);
+      expect(await repositories.get(workspace.workspaceId)).toEqual(workspace);
       expect(readExactSessionEntryRow(database, alias)?.entry).toMatchObject(original);
       expect(readExactSessionEntryRow(database, sessionKey)).toBeUndefined();
       order.length = 0;
@@ -600,8 +622,8 @@ it("keeps native alias deletion rollback and creation notifications with the ori
       expect(order).toEqual(["prepare", "native", "committed", "published", "followup", "release"]);
       expect(readExactSessionEntryRow(database, alias)).toBeUndefined();
       expect(readExactSessionEntryRow(database, sessionKey)?.entry).toMatchObject(original);
-      expect(repositories.get(workspace.workspaceId)).toBeUndefined();
-      expect(repositories.get(siblingWorkspace.workspaceId)).toEqual(siblingWorkspace);
+      expect(await repositories.get(workspace.workspaceId)).toBeUndefined();
+      expect(await repositories.get(siblingWorkspace.workspaceId)).toEqual(siblingWorkspace);
     } finally {
       stop();
       markPluginRegistryRetired(registry);

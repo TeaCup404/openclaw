@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { EOL, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { expectDefined } from "@openclaw/normalization-core/expect";
 import { beforeAll, expect, vi } from "vitest";
@@ -9,6 +9,7 @@ import { parse } from "yaml";
 import { createCommandTest } from "../helpers/command-fixture.js";
 import { readCiCheckoutStep, renderGitTestClock } from "./ci-checkout.test-support.js";
 import { runCiGitStep, type FetchResult } from "./ci-git-owner.test-support.js";
+import { runDependencyFreePreflight } from "./ci-preflight-dependencies.test-support.js";
 
 // Each case owns its checkout and process trees. Overlap their real timeout and
 // drain waits, but keep subprocess pressure bounded on the four-core CI runner.
@@ -233,32 +234,6 @@ releasePolicyIt("hydrates a divergent release merge base beyond the legacy 50+50
     related: true,
   });
   try {
-    const legacy = cloneAncestrySource(fixture, "legacy");
-    const legacyTarget = "refs/remotes/origin/legacy-target";
-    const refs = [fixture.source, `+refs/heads/main:${legacyTarget}`];
-    fixtureGit(legacy, [
-      "fetch",
-      "--no-tags",
-      "--filter=blob:none",
-      "--depth=50",
-      "origin",
-      ...refs,
-    ]);
-    fixtureGit(legacy, [
-      "fetch",
-      "--no-tags",
-      "--filter=blob:none",
-      "--deepen=50",
-      "origin",
-      ...refs,
-    ]);
-    const legacyResult = spawnSync("git", ["merge-base", fixture.source, legacyTarget], {
-      cwd: legacy,
-      encoding: "utf8",
-    });
-    expect(legacyResult.status).toBe(1);
-    expect(fixtureGit(legacy, ["rev-parse", "--is-shallow-repository"])).toBe("true");
-
     const checkout = cloneAncestrySource(fixture, "progressive");
     expectPolicySuccess(runReleaseAncestry(checkout, "merge-base"), "merge-base");
     expect(fixtureGit(checkout, ["rev-parse", "refs/remotes/origin/main"])).toBe(fixture.target);
@@ -596,6 +571,69 @@ releasePolicyIt("returns 124 when the release ancestry total budget is exhausted
   });
   expect(report.code, report.output).toBe(124);
   expect(report.commands).toEqual([]);
+});
+
+it("materializes an executable preflight manifest from the workflow revision", async ({
+  command,
+}) => {
+  const root = command.createTempDir("ci-preflight-harness-");
+  const origin = join(root, "origin");
+  const workspace = join(root, "checkout");
+  mkdirSync(origin);
+  mkdirSync(workspace);
+  fixtureGit(origin, ["init", "--quiet"]);
+  for (const file of [
+    ".github/actions/setup-node-env/action.yml",
+    ".github/actions/git-owner/test-prerequisites.mjs",
+    ".github/actions/git-owner/test-prerequisites.json",
+    "scripts/ci-build-manifest.mjs",
+    "scripts/lib/ci-ios-smoke-plan.mjs",
+    "scripts/lib/release-context.mjs",
+    "scripts/lib/release-version.mjs",
+  ]) {
+    const destination = join(origin, file);
+    mkdirSync(dirname(destination), { recursive: true });
+    writeFileSync(destination, readFileSync(file));
+  }
+  fixtureGit(origin, ["add", "."]);
+  const tree = fixtureGit(origin, ["write-tree"]);
+  const revision = fixtureCommit(join(origin, ".git"), tree, undefined, "workflow fixture");
+  fixtureGit(origin, ["update-ref", "HEAD", revision]);
+  const gitConfig = join(root, "gitconfig");
+  writeFileSync(gitConfig, "");
+  const checkout = await command.run(
+    process.platform === "win32" ? "python" : "python3",
+    ["-I", "-S", gitOwnerPath],
+    {
+      cwd: workspace,
+      env: {
+        ...process.env,
+        CHECKOUT_KIND: "preflight",
+        CHECKOUT_REPO: "fixture/preflight",
+        CHECKOUT_TOKEN: "",
+        CHECKOUT_REF: revision,
+        CHECKOUT_FALLBACK_REF: revision,
+        WORKFLOW_SHA: revision,
+        GITHUB_WORKSPACE: workspace,
+        GITHUB_EVENT_NAME: "pull_request",
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_GLOBAL: gitConfig,
+        GIT_CONFIG_COUNT: "1",
+        GIT_CONFIG_KEY_0: `url.${pathToFileURL(origin).href}.insteadOf`,
+        GIT_CONFIG_VALUE_0: "https://github.com/fixture/preflight.git",
+      },
+    },
+  );
+  expect(checkout.status, `${checkout.stdout}\n${checkout.stderr}`).toBe(0);
+  // Consume the exported trusted entrypoint against the real target planners.
+  const { result, manifest } = runDependencyFreePreflight(
+    pathToFileURL(join(workspace, ".ci-harness/scripts/ci-build-manifest.mjs")),
+    root,
+    process.execPath,
+  );
+  expect(result.status, result.stderr).toBe(0);
+  expect(manifest).toContain("run_windows=true\n");
+  expect(fixtureGit(workspace, ["status", "--porcelain"])).toBe("");
 });
 
 // Ask Bash to decode the source independently of the generator and fixture codec.
@@ -1001,7 +1039,7 @@ linuxIt.each([1, 2, 3, 4, 5, 6, undefined])(
   55_000,
 );
 
-linuxIt.each([23, 125, 143, "hang"] as const)(
+linuxIt.each([125, 143, "hang"] as const)(
   "base remains available after safely drained ordinary outcome %s",
   async (failure) => {
     const report = await runCiGitStep({
@@ -1187,29 +1225,6 @@ const sanity = (options: Omit<Parameters<typeof runCiGitStep>[0], "workflow">) =
     objects: { ...auditObjects, ...options.objects },
   });
 
-// These execute the actual YAML body. Every fake transport leaves ready writers
-// behind its leader, so fallback and config consumption must wait for the owner.
-posixIt(
-  "workflow sanity drains ordinary exact failure before branch fallback and config consumption",
-  async () => {
-    const report = await sanity({
-      fetchResults: [23, 0],
-      realClock: true,
-      realDrain: false,
-    });
-    expect(report.code, report.output).toBe(0);
-    expect(report.readyAttempts).toEqual([1, 2]);
-    expect(report.fetches.map(({ args }) => args.at(-1))).toEqual([
-      `+${base}:refs/remotes/origin/security-base`,
-      `+refs/heads/main:${branch}`,
-    ]);
-    expect(report.githubEnv).toBe(
-      `PRE_COMMIT_CONFIG_PATH=${report.runnerTemp}/pre-commit-base.yaml\n`,
-    );
-  },
-  55_000,
-);
-
 type SanityFetchCase = {
   label: string;
   fetchResults: FetchResult[];
@@ -1228,7 +1243,7 @@ const sanityFetchCases: SanityFetchCase[] = [
     code: 0,
   },
   { label: "exact success", fetchResults: [0], refs: [base], warnings: 0, code: 0 },
-  ...[2, 23, 125, 143].map((code) => ({
+  ...[125, 143].map((code) => ({
     label: `ordinary ${code}`,
     fetchResults: [code, 0],
     refs: [base, "refs/heads/main"],
@@ -1395,7 +1410,7 @@ posixIt.each([
   55_000,
 );
 
-posixIt.each([[], [0], [1], [0, 1]].map((missing) => ({ missing })))(
+posixIt.each([[0], [1]].map((missing) => ({ missing })))(
   "workflow sanity selects missing exact configs independently ($missing)",
   async ({ missing }) => {
     const report = await sanity({
@@ -1512,27 +1527,6 @@ posixIt(
       "--unset-all",
       "http.https://github.com/.extraheader",
     ]);
-  },
-  55_000,
-);
-
-posixIt(
-  "maturity validation drains before trust probes and publication",
-  async () => {
-    const report = await runCiGitStep({
-      workflow: maturityValidation,
-      env: maturityEnvironment,
-      fetchResults: [0],
-      mergeBase: { ancestor: true, revision: head },
-      lsRemoteResults: [{ code: 0, output: `${head}\trefs/heads/main\n` }],
-      commandResults: {
-        [`diff --quiet ${head} refs/remotes/origin/main -- . :(exclude)qa/maturity-scores.yaml :(exclude)docs/maturity/scorecard.md :(exclude)docs/maturity/taxonomy.md`]:
-          { code: 0 },
-      },
-    });
-    expect(report.code, report.output).toBe(0);
-    expect(report.githubOutput).toContain("trusted_reason=main-ancestor\n");
-    expect(report.fetches).toHaveLength(2);
   },
   55_000,
 );

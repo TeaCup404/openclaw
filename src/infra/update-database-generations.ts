@@ -9,6 +9,7 @@ import {
 export type UpdateDatabaseGenerations = Record<string, string | null>;
 export type UpdateDatabaseWriteReceipt = {
   unchanged: boolean;
+  fromGenerations?: UpdateDatabaseGenerations;
   generations: UpdateDatabaseGenerations;
 };
 
@@ -51,7 +52,8 @@ function readWalIndexHeader(pathname: string): Buffer | null {
   }
 }
 
-/** Run only in an isolated process or after all source handles drain: raw close
+/** Run only in an isolated process, after all source handles drain, or under a
+ * schema-maintenance owner before live reads are admitted: raw close
  * can release this process's SQLite locks. Inspect only the supplied inventory. */
 export function readUpdateDatabaseGenerations(paths: readonly string[]): UpdateDatabaseGenerations {
   return Object.fromEntries(
@@ -79,11 +81,15 @@ export function readUpdateDatabaseGenerations(paths: readonly string[]): UpdateD
       ) {
         throw new Error(`SQLite WAL commit publication could not be verified: ${pathname}`);
       }
+      // Native exclusion may create an empty WAL without a write. It contains
+      // no commit; retain every other physical fingerprint and publication header.
+      const writeGeneration =
+        generation.wal?.size === 0n ? { ...generation, wal: undefined } : generation;
       return [
         pathname,
         sha256Hex(
           JSON.stringify([
-            serializeSqliteFileGeneration(generation),
+            serializeSqliteFileGeneration(writeGeneration),
             after?.toString("hex") ?? null,
           ]),
         ),
