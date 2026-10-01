@@ -445,10 +445,9 @@ describe("openai image generation provider", () => {
     it.each(["", "x-request-id", "request-id"])("retries rejection (%s)", async (header) => {
       mockCodexAuthOnly();
       mockCodexImageStream();
-      const { assertOkOrThrowHttpError } =
-        await vi.importActual<typeof import("openclaw/plugin-sdk/provider-http")>(
-          "openclaw/plugin-sdk/provider-http",
-        );
+      const { assertOkOrThrowHttpError } = await vi.importActual<
+        typeof import("openclaw/plugin-sdk/provider-http")
+      >("openclaw/plugin-sdk/provider-http");
       assertOkOrThrowHttpErrorMock.mockImplementationOnce(() =>
         assertOkOrThrowHttpError(
           new Response(
