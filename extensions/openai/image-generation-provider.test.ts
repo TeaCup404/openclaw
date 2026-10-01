@@ -74,7 +74,8 @@ vi.mock("openclaw/plugin-sdk/provider-auth-runtime", () => ({
   resolveApiKeyForProvider: resolveApiKeyForProviderMock,
 }));
 
-vi.mock("openclaw/plugin-sdk/provider-http", () => ({
+vi.mock("openclaw/plugin-sdk/provider-http", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("openclaw/plugin-sdk/provider-http")>()),
   assertOkOrThrowHttpError: assertOkOrThrowHttpErrorMock,
   postJsonRequest: postJsonRequestMock,
   postMultipartRequest: postMultipartRequestMock,
@@ -441,12 +442,23 @@ describe("openai image generation provider", () => {
       expect(result.images[0]?.buffer).toEqual(Buffer.from("codex-image"));
     });
 
-    it("retries Codex OAuth image generation with a configured model the plan supports", async () => {
+    it.each(["", "x-request-id", "request-id"])("retries rejection (%s)", async (header) => {
       mockCodexAuthOnly();
       mockCodexImageStream();
-      assertOkOrThrowHttpErrorMock.mockRejectedValueOnce(
-        new Error(
-          "OpenAI Codex image generation failed (HTTP 400): The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT account.",
+      const { assertOkOrThrowHttpError } =
+        await vi.importActual<typeof import("openclaw/plugin-sdk/provider-http")>(
+          "openclaw/plugin-sdk/provider-http",
+        );
+      assertOkOrThrowHttpErrorMock.mockImplementationOnce(() =>
+        assertOkOrThrowHttpError(
+          new Response(
+            JSON.stringify({
+              detail:
+                "The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT account.",
+            }),
+            { status: 400, headers: header ? { [header]: "req-image-proof" } : {} },
+          ),
+          "OpenAI Codex image generation failed",
         ),
       );
 

@@ -507,12 +507,31 @@ async function logCodexImageAuthSelected(params: {
   );
 }
 
+function isCodexModelUnavailableBody(body: string | undefined, model: string): boolean {
+  if (!body) {
+    return false;
+  }
+  try {
+    const payload: unknown = JSON.parse(body);
+    return (
+      typeof payload === "object" &&
+      payload !== null &&
+      "detail" in payload &&
+      payload.detail ===
+        `The '${model}' model is not supported when using Codex with a ChatGPT account.`
+    );
+  } catch {
+    return false;
+  }
+}
+
 async function generateOpenAICodexImage(params: {
   req: Parameters<ImageGenerationProvider["generateImage"]>[0];
   apiKey: string;
 }): Promise<ImageGenerationResult> {
   const [
     {
+      ProviderHttpError,
       assertOkOrThrowHttpError,
       postJsonRequest,
       resolveProviderHttpRequestConfig,
@@ -626,9 +645,9 @@ async function generateOpenAICodexImage(params: {
         const nextResponsesModel = retryResponsesModels.shift();
         if (
           !nextResponsesModel ||
-          !(error instanceof Error) ||
-          error.message !==
-            `OpenAI Codex image generation failed (HTTP 400): The '${responsesModel}' model is not supported when using Codex with a ChatGPT account.`
+          !(error instanceof ProviderHttpError) ||
+          error.status !== 400 ||
+          !isCodexModelUnavailableBody(error.errorBody, responsesModel)
         ) {
           throw error;
         }
